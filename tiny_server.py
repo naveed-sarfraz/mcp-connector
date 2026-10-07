@@ -29,6 +29,7 @@ DATASETS = {
         "searchable_columns": ("physician_name", "specialty"),
     }
 }
+DEFAULT_DATASET = "supabase_data"
 
 PERMISSIONS = {
     "owner": {"supabase_data"},
@@ -319,8 +320,9 @@ def query_supabase(dataset: str, text: str, limit: int) -> list[dict[str, str | 
         openWorldHint=False,
     ),
 )
-def describe_dataset(dataset: str) -> str:
-    """Describe the searchable columns of an accessible dataset."""
+def describe_dataset() -> str:
+    """Describe the physician dataset and the columns available for searching."""
+    dataset = DEFAULT_DATASET
     user = _authorized_user("describe_dataset", dataset)
     result = {
         "dataset": dataset,
@@ -339,8 +341,9 @@ def describe_dataset(dataset: str) -> str:
         openWorldHint=True,
     ),
 )
-def search_dataset(dataset: str, text: str, limit: int = 10) -> str:
-    """Find matching rows in an accessible dataset, with a bounded result size."""
+def search_dataset(text: str, limit: int = 10) -> str:
+    """Search physician names and specialties, returning at most 50 matches."""
+    dataset = DEFAULT_DATASET
     user = _authorized_user("search_dataset", dataset)
     search_text = text.strip() if isinstance(text, str) else ""
     if not 1 <= len(search_text) <= 100:

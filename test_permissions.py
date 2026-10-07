@@ -36,8 +36,8 @@ def test_asha_can_describe_and_search_with_mocked_connector(
         return [{"physician_name": "Asha Rao", "specialty": "Cardiology"}]
 
     monkeypatch.setattr(tiny_server, "query_supabase", fake_query)
-    description = json.loads(describe_dataset("supabase_data"))
-    rows = json.loads(search_dataset("supabase_data", "cardio"))
+    description = json.loads(describe_dataset())
+    rows = json.loads(search_dataset("cardio"))
 
     assert description["searchable_columns"] == ["physician_name", "specialty"]
     assert rows[0]["physician_name"] == "Asha Rao"
@@ -58,21 +58,20 @@ def test_ravi_and_guest_can_search_when_permissions_are_disabled(
 
     monkeypatch.setattr(tiny_server, "query_supabase", fake_query)
 
-    assert json.loads(search_dataset("supabase_data", "cardio")) == []
+    assert json.loads(search_dataset("cardio")) == []
     assert calls == [("supabase_data", "cardio", 10)]
 
 
-def test_unknown_and_forbidden_datasets_share_the_same_error(
+def test_forbidden_user_cannot_describe_dataset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(tiny_server, "ENFORCE_USER_PERMISSIONS", True)
-    messages = []
-    for user, dataset in (("guest", "supabase_data"), ("asha", "unknown")):
-        set_verified_user(monkeypatch, user)
-        with pytest.raises(ToolError) as error:
-            describe_dataset(dataset)
-        messages.append(str(error.value))
-    assert messages == [tiny_server.DENIED_MESSAGE] * 2
+    set_verified_user(monkeypatch, "guest")
+
+    with pytest.raises(ToolError) as error:
+        describe_dataset()
+
+    assert str(error.value) == tiny_server.DENIED_MESSAGE
 
 
 def test_static_bearer_token_is_verified_without_exposing_it() -> None:
@@ -103,7 +102,7 @@ def test_bad_search_text_is_rejected_before_connector(
         lambda *args: pytest.fail("invalid text must not reach the connector"),
     )
     with pytest.raises(ToolError, match="1 to 100 characters"):
-        search_dataset("supabase_data", text)
+        search_dataset(text)
 
 
 @pytest.mark.parametrize(("requested", "expected"), [(0, 1), (500, 50)])
@@ -117,7 +116,7 @@ def test_search_limit_is_clamped(
         "query_supabase",
         lambda dataset, text, limit: calls.append(limit) or [],
     )
-    search_dataset("supabase_data", "cardio", requested)
+    search_dataset("cardio", requested)
     assert calls == [expected]
 
 
@@ -133,7 +132,7 @@ def test_database_errors_are_generic_and_redacted(
 
     monkeypatch.setattr(tiny_server, "query_supabase", fail_query)
     with pytest.raises(ToolError) as error:
-        search_dataset("supabase_data", "cardio")
+        search_dataset("cardio")
 
     log = capsys.readouterr().out
     assert str(error.value) == tiny_server.UNAVAILABLE_MESSAGE

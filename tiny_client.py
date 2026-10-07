@@ -39,7 +39,7 @@ async def main(server_url: str, token: str, text: str) -> None:
 
                 result = await client.call_tool(
                     "search_dataset",
-                    {"dataset": "supabase_data", "text": text, "limit": 10},
+                    {"text": text, "limit": 10},
                 )
                 if result.is_error:
                     print(f"DENIED: {result.content[0].text}")

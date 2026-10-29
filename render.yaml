@@ -7,9 +7,3 @@ services:
     envVars:
       - key: SUPABASE_DB_URL
         sync: false
-      - key: MCP_AUTH_PASSWORD
-        sync: false
-      - key: MCP_OAUTH_SIGNING_KEY
-        generateValue: true
-      - key: MCP_BEARER_TOKEN
-        generateValue: true

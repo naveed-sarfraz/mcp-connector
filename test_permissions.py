@@ -1,34 +1,22 @@
-"""Tests for permissions, validation, and the read-only Supabase connector."""
+"""Tests for public access, validation, and the read-only connector."""
 
-import asyncio
 import json
 import os
-from types import SimpleNamespace
 
 import pytest
 import tiny_server
 from mcp.server.mcpserver.exceptions import ToolError
-from oauth_provider import OwnerOAuthProvider
-from tiny_server import (
-    DATASETS,
-    SUPABASE_DB_URL,
-    can_access,
-    describe_dataset,
-    search_dataset,
-)
+from tiny_server import DATASETS, SUPABASE_DB_URL, describe_dataset, search_dataset
 
 
-def set_verified_user(monkeypatch: pytest.MonkeyPatch, user: str | None) -> None:
-    access_token = (
-        None if user is None else SimpleNamespace(client_id=user, subject=None)
-    )
-    monkeypatch.setattr(tiny_server, "get_access_token", lambda: access_token)
+def test_server_has_no_mcp_authentication_provider() -> None:
+    assert tiny_server.mcp._auth_server_provider is None
+    assert tiny_server.mcp.settings.auth is None
 
 
-def test_asha_can_describe_and_search_with_mocked_connector(
+def test_public_client_can_describe_and_search_with_mocked_connector(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    set_verified_user(monkeypatch, "asha")
     calls: list[tuple[str, str, int]] = []
 
     def fake_query(dataset: str, text: str, limit: int) -> list[dict[str, str]]:
@@ -44,58 +32,10 @@ def test_asha_can_describe_and_search_with_mocked_connector(
     assert calls == [("supabase_data", "cardio", 10)]
 
 
-@pytest.mark.parametrize("user", ["ravi", "guest"])
-def test_ravi_and_guest_can_search_when_permissions_are_disabled(
-    monkeypatch: pytest.MonkeyPatch, user: str
-) -> None:
-    assert not tiny_server.ENFORCE_USER_PERMISSIONS
-    set_verified_user(monkeypatch, user)
-    calls: list[tuple[str, str, int]] = []
-
-    def fake_query(dataset: str, text: str, limit: int) -> list[dict[str, str]]:
-        calls.append((dataset, text, limit))
-        return []
-
-    monkeypatch.setattr(tiny_server, "query_supabase", fake_query)
-
-    assert json.loads(search_dataset("cardio")) == []
-    assert calls == [("supabase_data", "cardio", 10)]
-
-
-def test_forbidden_user_cannot_describe_dataset(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(tiny_server, "ENFORCE_USER_PERMISSIONS", True)
-    set_verified_user(monkeypatch, "guest")
-
-    with pytest.raises(ToolError) as error:
-        describe_dataset()
-
-    assert str(error.value) == tiny_server.DENIED_MESSAGE
-
-
-def test_static_bearer_token_is_verified_without_exposing_it() -> None:
-    provider = OwnerOAuthProvider(
-        issuer_url="https://mcp.example.com",
-        resource_url="https://mcp.example.com/mcp",
-        signing_key="a-test-signing-key-that-is-long-enough",
-        owner_password="test-password",
-        bearer_token="expected-bearer-token",
-    )
-    accepted = asyncio.run(provider.load_access_token("expected-bearer-token"))
-    rejected = asyncio.run(provider.load_access_token("wrong-token"))
-
-    assert accepted is not None
-    assert accepted.subject == "owner"
-    assert accepted.resource == "https://mcp.example.com/mcp"
-    assert rejected is None
-
-
 @pytest.mark.parametrize("text", ["", "   ", "x" * 101])
 def test_bad_search_text_is_rejected_before_connector(
     monkeypatch: pytest.MonkeyPatch, text: str
 ) -> None:
-    set_verified_user(monkeypatch, "asha")
     monkeypatch.setattr(
         tiny_server,
         "query_supabase",
@@ -109,7 +49,6 @@ def test_bad_search_text_is_rejected_before_connector(
 def test_search_limit_is_clamped(
     monkeypatch: pytest.MonkeyPatch, requested: int, expected: int
 ) -> None:
-    set_verified_user(monkeypatch, "asha")
     calls: list[int] = []
     monkeypatch.setattr(
         tiny_server,
@@ -123,7 +62,6 @@ def test_search_limit_is_clamped(
 def test_database_errors_are_generic_and_redacted(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    set_verified_user(monkeypatch, "asha")
     connection_url = "postgresql://dbuser:very-secret@db.example/postgres"
     monkeypatch.setattr(tiny_server, "SUPABASE_DB_URL", connection_url)
 
@@ -141,14 +79,9 @@ def test_database_errors_are_generic_and_redacted(
     assert "[redacted connection string]" in log
 
 
-def test_unknown_and_forbidden_users_have_no_access() -> None:
-    assert tiny_server.ENFORCE_USER_PERMISSIONS is False
-    assert can_access("owner", "supabase_data")
-    assert can_access("asha", "supabase_data")
-    assert not can_access("ravi", "supabase_data")
-    assert not can_access("guest", "supabase_data")
-    assert not can_access("unknown", "supabase_data")
-    assert not can_access("asha", "unknown")
+def test_unknown_dataset_is_not_public() -> None:
+    with pytest.raises(ToolError, match=tiny_server.DENIED_MESSAGE):
+        tiny_server._public_actor("search_dataset", "unknown")
 
 
 def test_supabase_read_only_integration() -> None:

@@ -12,7 +12,7 @@ COPY requirements.txt ./
 RUN python -m pip install --upgrade pip && \
     python -m pip install -r requirements.txt
 
-COPY tiny_server.py oauth_provider.py ./
+COPY tiny_server.py ./
 
 USER app
 EXPOSE 8000

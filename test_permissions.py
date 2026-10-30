@@ -1,107 +1,181 @@
-"""Tests for public access, validation, and the read-only connector."""
+"""Tests for MCP user and report authorization decisions."""
 
-import json
-import os
+from __future__ import annotations
+
+from dataclasses import replace
 
 import pytest
-import tiny_server
+from mcp.server.auth.provider import AccessToken
 from mcp.server.mcpserver.exceptions import ToolError
-from tiny_server import DATASETS, SUPABASE_DB_URL, describe_dataset, search_dataset
+
+import tiny_server
+from config import settings
+from database import Database, UserAccess
 
 
-def test_server_has_no_mcp_authentication_provider() -> None:
-    assert tiny_server.mcp._auth_server_provider is None
-    assert tiny_server.mcp.settings.auth is None
+def user(**overrides: object) -> UserAccess:
+    values = {
+        "user_id": 42,
+        "active": True,
+        "soft_deleted": False,
+        "role": "CLIENT",
+        "company_id": 7,
+        "client_admin": False,
+        "membership": "silver",
+    }
+    values.update(overrides)
+    return UserAccess(**values)  # type: ignore[arg-type]
 
 
-def test_public_client_can_describe_and_search_with_mocked_connector(
+@pytest.mark.parametrize(
+    ("role", "membership", "company_id"),
+    [("EXPERT", None, None), ("CLIENT", "personal", 7), ("ADMIN", "platinum", 3)],
+)
+def test_all_active_roles_plans_and_companies_can_use_mcp(
+    role: str, membership: str | None, company_id: int | None
+) -> None:
+    assert user(role=role, membership=membership, company_id=company_id).mcp_allowed
+
+
+@pytest.mark.parametrize(
+    "record",
+    [user(active=False), user(soft_deleted=True)],
+)
+def test_inactive_or_deleted_users_are_not_allowed(record: UserAccess) -> None:
+    assert not record.mcp_allowed
+
+
+@pytest.mark.asyncio
+async def test_authenticated_active_user_is_loaded_from_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    record = user()
+
+    class FakeDatabase:
+        async def get_user(self, subject: str) -> UserAccess:
+            assert subject == "42"
+            return record
+
+    token = AccessToken(
+        token="opaque", client_id="client", scopes=["reports:read"], subject="42"
+    )
+    monkeypatch.setattr(tiny_server, "get_access_token", lambda: token)
+    monkeypatch.setattr(tiny_server, "database", FakeDatabase())
+    assert await tiny_server.require_current_user() == record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record", [None, user(active=False), user(soft_deleted=True)])
+async def test_missing_inactive_or_deleted_user_is_denied(
+    monkeypatch: pytest.MonkeyPatch, record: UserAccess | None
+) -> None:
+    class FakeDatabase:
+        async def get_user(self, subject: str) -> UserAccess | None:
+            return record
+
+    token = AccessToken(
+        token="opaque", client_id="client", scopes=["reports:read"], subject="42"
+    )
+    monkeypatch.setattr(tiny_server, "get_access_token", lambda: token)
+    monkeypatch.setattr(tiny_server, "database", FakeDatabase())
+    with pytest.raises(ToolError, match="not authorized"):
+        await tiny_server.require_current_user()
+
+
+@pytest.mark.asyncio
+async def test_unauthenticated_remote_tool_call_is_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(tiny_server, "get_access_token", lambda: None)
+    monkeypatch.delenv("MCP_TRANSPORT", raising=False)
+    with pytest.raises(ToolError, match="Authentication is required"):
+        await tiny_server.require_current_user()
+
+
+class FakeCursor:
+    def __init__(self, result: dict[str, int] | None = None):
+        self.result = result
+        self.statement = ""
+        self.params: tuple[object, ...] = ()
+
+    def __enter__(self) -> "FakeCursor":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def execute(self, statement: str, params: tuple[object, ...]) -> int:
+        self.statement = statement
+        self.params = params
+        return 1
+
+    def fetchone(self) -> dict[str, int] | None:
+        return self.result
+
+
+class FakeConnection:
+    def __init__(self, cursor: FakeCursor):
+        self._cursor = cursor
+
+    def cursor(self) -> FakeCursor:
+        return self._cursor
+
+
+@pytest.mark.asyncio
+async def test_company_admin_uses_company_purchase_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    configured = replace(settings, oauth_signing_key="x" * 48)
+    db = Database(configured)
+    cursor = FakeCursor({"allowed": 1})
+
+    async def run(operation):  # type: ignore[no-untyped-def]
+        return operation(FakeConnection(cursor))
+
+    monkeypatch.setattr(db, "_run", run)
+    allowed = await db.can_access_full_report(
+        user(role="CLIENT", client_admin=True, company_id=7), "a" * 24
+    )
+    assert allowed
+    assert "purchaser.company_id" in cursor.statement
+    assert cursor.params == (7, "a" * 24)
+
+
+@pytest.mark.asyncio
+async def test_non_admin_cannot_use_another_company_purchase(monkeypatch: pytest.MonkeyPatch) -> None:
+    configured = replace(settings, oauth_signing_key="x" * 48)
+    db = Database(configured)
+    cursor = FakeCursor(None)
+
+    async def run(operation):  # type: ignore[no-untyped-def]
+        return operation(FakeConnection(cursor))
+
+    monkeypatch.setattr(db, "_run", run)
+    allowed = await db.can_access_full_report(
+        user(role="CLIENT", client_admin=False, company_id=7), "b" * 24
+    )
+    assert not allowed
+    assert "WHERE user_id = %s" in cursor.statement
+    assert cursor.params == (42, "b" * 24)
+
+
+@pytest.mark.asyncio
+async def test_platinum_membership_can_read_full_report_without_purchase(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[tuple[str, str, int]] = []
-
-    def fake_query(dataset: str, text: str, limit: int) -> list[dict[str, str]]:
-        calls.append((dataset, text, limit))
-        return [{"physician_name": "Asha Rao", "specialty": "Cardiology"}]
-
-    monkeypatch.setattr(tiny_server, "query_supabase", fake_query)
-    description = json.loads(describe_dataset())
-    rows = json.loads(search_dataset("cardio"))
-
-    assert description["searchable_columns"] == ["physician_name", "specialty"]
-    assert rows[0]["physician_name"] == "Asha Rao"
-    assert calls == [("supabase_data", "cardio", 10)]
+    configured = replace(settings, oauth_signing_key="x" * 48)
+    db = Database(configured)
+    monkeypatch.setattr(db, "_run", lambda operation: pytest.fail("database query not expected"))
+    assert await db.can_access_full_report(user(membership="platinum"), "c" * 24)
 
 
-@pytest.mark.parametrize("text", ["", "   ", "x" * 101])
-def test_bad_search_text_is_rejected_before_connector(
-    monkeypatch: pytest.MonkeyPatch, text: str
+@pytest.mark.asyncio
+async def test_gold_topic_subscription_can_read_matching_full_report(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        tiny_server,
-        "query_supabase",
-        lambda *args: pytest.fail("invalid text must not reach the connector"),
+    configured = replace(settings, oauth_signing_key="x" * 48)
+    db = Database(configured)
+    cursor = FakeCursor({"title": "Artificial Intelligence"})
+
+    async def run(operation):  # type: ignore[no-untyped-def]
+        return operation(FakeConnection(cursor))
+
+    monkeypatch.setattr(db, "_run", run)
+    assert await db.can_access_full_report(
+        user(membership="gold"), "d" * 24, ["Artificial Intelligence"]
     )
-    with pytest.raises(ToolError, match="1 to 100 characters"):
-        search_dataset(text)
-
-
-@pytest.mark.parametrize(("requested", "expected"), [(0, 1), (500, 50)])
-def test_search_limit_is_clamped(
-    monkeypatch: pytest.MonkeyPatch, requested: int, expected: int
-) -> None:
-    calls: list[int] = []
-    monkeypatch.setattr(
-        tiny_server,
-        "query_supabase",
-        lambda dataset, text, limit: calls.append(limit) or [],
-    )
-    search_dataset("cardio", requested)
-    assert calls == [expected]
-
-
-def test_database_errors_are_generic_and_redacted(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    connection_url = "postgresql://dbuser:very-secret@db.example/postgres"
-    monkeypatch.setattr(tiny_server, "SUPABASE_DB_URL", connection_url)
-
-    def fail_query(dataset: str, text: str, limit: int) -> list[dict[str, str]]:
-        raise RuntimeError(f"connection failed for {connection_url}")
-
-    monkeypatch.setattr(tiny_server, "query_supabase", fail_query)
-    with pytest.raises(ToolError) as error:
-        search_dataset("cardio")
-
-    log = capsys.readouterr().out
-    assert str(error.value) == tiny_server.UNAVAILABLE_MESSAGE
-    assert "very-secret" not in log
-    assert connection_url not in log
-    assert "[redacted connection string]" in log
-
-
-def test_unknown_dataset_is_not_public() -> None:
-    with pytest.raises(ToolError, match=tiny_server.DENIED_MESSAGE):
-        tiny_server._public_actor("search_dataset", "unknown")
-
-
-def test_supabase_read_only_integration() -> None:
-    if not SUPABASE_DB_URL or os.getenv("RUN_SUPABASE_INTEGRATION") != "1":
-        pytest.skip("set RUN_SUPABASE_INTEGRATION=1 to run the live read-only test")
-
-    rows = None
-    error_type = None
-    try:
-        rows = tiny_server.query_supabase("supabase_data", "a", 1)
-    except Exception as error:
-        error_type = type(error).__name__
-    if error_type is not None:
-        pytest.fail(
-            f"Supabase read failed ({error_type}); check the local database settings.",
-            pytrace=False,
-        )
-
-    assert len(rows) <= 1
-    assert all(
-        set(row) == set(DATASETS["supabase_data"]["searchable_columns"])
-        for row in rows
-    )
+    assert "user_sectors" in cursor.statement

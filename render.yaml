@@ -1,9 +1,39 @@
 services:
   - type: web
-    name: bis-physicians-mcp
+    name: insightmonk-reports-mcp
     runtime: docker
-    plan: free
+    plan: starter
     healthCheckPath: /health
     envVars:
-      - key: SUPABASE_DB_URL
+      - key: INSIGHTMONK_BASE_URL
+        value: https://community-api.insightmonk.com
+      - key: INSIGHTMONK_EMAIL
         sync: false
+      - key: INSIGHTMONK_PASSWORD
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: MYSQL_HOST
+        sync: false
+      - key: MYSQL_PORT
+        value: "3306"
+      - key: MYSQL_USER
+        sync: false
+      - key: MYSQL_PASSWORD
+        sync: false
+      - key: MYSQL_DATABASE
+        sync: false
+      - key: MYSQL_SSL
+        sync: false
+      - key: MCP_OAUTH_SIGNING_KEY
+        generateValue: true
+      - key: MCP_AUTO_MIGRATE
+        value: "1"
+      - key: MCP_TRANSPORT
+        value: streamable-http
+      - key: PDF_MAX_DOWNLOAD_BYTES
+        value: "52428800"
+      - key: PDF_MAX_EMBEDDED_BYTES
+        value: "20971520"
+      - key: LOG_LEVEL
+        value: INFO

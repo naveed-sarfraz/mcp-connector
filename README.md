@@ -1,155 +1,168 @@
-# Supabase Physician Search MCP Server
+# InsightMonk Reports MCP Server
 
-A public, read-only remote MCP server for searching `public.bis_physicians` by
-`physician_name` or `specialty`.
+An authenticated MCP server for searching, reading, searching within, and downloading InsightMonk reports from ChatGPT, Claude, MCP Inspector, and other OAuth-capable MCP clients.
 
-The server uses stateless Streamable HTTP and does not request a password, API
-key, bearer token, or OAuth login. Users add the public MCP URL once in ChatGPT,
-Claude, Codex, or another Streamable HTTP client. The AI platform keeps that
-connector configuration in the user's platform account and reconnects without
-asking for MCP credentials.
+The old Supabase physician connector has been removed. Supabase is not used anywhere in this repository now. The unrelated `outlook-calendar` project still has its own Supabase usage and was not changed.
 
-This is intentionally anonymous access: signing in to an AI platform does not
-send that user's platform identity to a third-party MCP server. Do not expose
-private or per-user data through this server without adding standards-based OAuth
-through an external identity provider.
+## Architecture
 
-## Security model
+The server reuses the existing systems in `/home/naveed/BIS/community-api`:
 
-- The public tools can only read physician names and specialties.
-- Database sessions force `default_transaction_read_only=on` and use TLS.
-- SQL identifiers are fixed in source and all search input is parameterized.
-- Searches accept 1–100 characters and return at most 50 rows.
-- Tool metadata marks every operation read-only, non-destructive, and idempotent.
-- Database credentials stay on the server and are redacted from error logs.
-- Remote deployments require HTTPS and the MCP path must be `/mcp`.
+- InsightMonk users sign in through `POST /v1/auth/login`; MFA users finish through `POST /v1/auth/verifyOTP`.
+- The returned application JWT is verified with the same `JWT_SECRET` as `community-api`.
+- Every MCP request reloads the user from the existing MySQL `users` table. Missing, inactive, or soft-deleted users are denied immediately.
+- All active roles, plans, and companies can connect to MCP. No new MCP user table or copied user record is created.
+- Existing full-report rules remain in force: platinum users, matching gold topic subscribers, individual purchases, and company purchases for client administrators.
+- A server-side InsightMonk service account calls the report APIs only after user authorization. Its credentials and token never reach the MCP client.
 
-Because there is no MCP authentication, anyone who knows the URL can query these
-two public fields. Add rate limiting at the hosting edge and use a dedicated,
-read-only database role. If the data should not be public, use an OAuth identity
-provider instead of this anonymous mode.
+Remote clients use OAuth 2.1 authorization code flow with PKCE S256, dynamic client registration, protected-resource metadata, rotating refresh tokens, revocation, and resource-bound access tokens. The AI platform stores and refreshes its connection. The user enters InsightMonk credentials only in the MCP server's HTTPS login page during initial authorization; passwords are never stored.
 
-## Important security step
+Three small MySQL tables store OAuth protocol state only:
 
-An earlier copy of `.env.example` contained a real Supabase password. Rotate that
-database password in Supabase before deploying. Use a dedicated read-only database
-role for this connector when possible. `.env.example` contains placeholders only,
-and `.env` is excluded from Git and Docker builds.
+- `mcp_oauth_clients`
+- `mcp_oauth_artifacts`
+- `mcp_oauth_revocations`
 
-## Local setup
+They do not duplicate application users. Client secrets are encrypted, authorization codes are hashed and one-time use, refresh tokens are hashed and rotated, and access tokens are signed. Active connections remain persistent because each normal refresh rotates the token and renews its lifetime.
 
-Use Python 3.11 or newer:
+## MCP tools
+
+- `search_reports(search, from_date, to_date, report_type, page, limit)`
+- `get_report_content(report_id)`
+- `download_report_pdf(report_id)`
+- `search_report_content(report_id, query, limit)`
+
+PDFs are downloaded only from validated public HTTPS hosts, with redirect and size limits. Text is extracted page by page with page numbers and cached in memory for 15 minutes by default. Empty-image pages are reported as requiring OCR. The original PDF is returned as an embedded MCP resource, not as a signed storage URL.
+
+## Required environment variables
+
+Copy `.env.example` to `.env` and configure:
+
+```dotenv
+INSIGHTMONK_BASE_URL=https://community-api.insightmonk.com
+INSIGHTMONK_EMAIL=service-account@example.com
+INSIGHTMONK_PASSWORD=...
+
+# Same value and database used by community-api.
+JWT_SECRET=...
+MYSQL_HOST=...
+MYSQL_PORT=3306
+MYSQL_USER=...
+MYSQL_PASSWORD=...
+MYSQL_DATABASE=...
+MYSQL_SSL=1
+MYSQL_SSL_CA=
+
+MCP_SERVER_URL=http://127.0.0.1:8000/mcp
+MCP_OAUTH_SIGNING_KEY=at-least-32-random-characters
+MCP_AUTO_MIGRATE=1
+MCP_TRANSPORT=streamable-http
+```
+
+Generate a signing key with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Keep `MCP_OAUTH_SIGNING_KEY` stable across deployments and instances. Changing it signs everyone out. Do not reuse `JWT_SECRET` as the MCP signing key.
+
+The service account must be able to retrieve all PDFs that legitimately authorized users may request. The MCP server independently enforces the connecting user's plan, topic, purchase, and company rules before returning content.
+
+## Local installation
+
+Python 3.11 or newer is required:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt
 cp .env.example .env
-```
-
-Configure `.env`:
-
-```dotenv
-SUPABASE_DB_URL=postgresql://USERNAME:PASSWORD@HOST:5432/DATABASE
-MCP_SERVER_URL=http://127.0.0.1:8000/mcp
-```
-
-Start the server:
-
-```bash
 python tiny_server.py
 ```
 
-Useful local URLs:
+Local endpoints:
 
-- MCP endpoint: `http://127.0.0.1:8000/mcp`
-- Health check: `http://127.0.0.1:8000/health`
-- Service metadata: `http://127.0.0.1:8000/`
+- MCP: `http://127.0.0.1:8000/mcp`
+- health: `http://127.0.0.1:8000/health`
+- OAuth metadata: `http://127.0.0.1:8000/.well-known/oauth-authorization-server`
+- protected-resource metadata: `http://127.0.0.1:8000/.well-known/oauth-protected-resource/mcp`
 
-Try an unauthenticated tool call:
+With `MCP_AUTO_MIGRATE=1`, startup creates the three MCP OAuth tables if needed. If the production DB role has no DDL permission, run `migrations/001_mcp_oauth.sql` once with a migration account and set `MCP_AUTO_MIGRATE=0`.
+
+## MCP Inspector
+
+For the complete remote-style OAuth flow:
 
 ```bash
-python tiny_client.py cardiology
+python tiny_server.py
+npx @modelcontextprotocol/inspector
 ```
+
+In Inspector, choose Streamable HTTP and enter `http://127.0.0.1:8000/mcp`. Start OAuth, sign in with an active InsightMonk account, then list and call the tools.
+
+For STDIO-only local development, set an existing active application user ID. This bypass exists only on loopback when the transport is explicitly STDIO:
+
+```bash
+MCP_TRANSPORT=stdio MCP_DEV_USER_ID=123 \
+  npx @modelcontextprotocol/inspector .venv/bin/python tiny_server.py
+```
+
+The included smoke client uses the same development mode:
+
+```bash
+python tiny_client.py "artificial intelligence" --user-id 123
+```
+
+Never set `MCP_DEV_USER_ID` on Render or any remote deployment.
 
 ## Deploy on Render
 
-This repository includes a non-root `Dockerfile` and a `render.yaml` Blueprint.
+The repository includes a non-root Docker image and `render.yaml` Blueprint.
 
-1. Rotate the exposed Supabase password and update your local `.env`.
-2. Push this folder to a private GitHub or GitLab repository.
-3. In Render, create a Blueprint from that repository.
-4. Enter `SUPABASE_DB_URL` when prompted.
-5. Deploy and wait for `/health` to pass.
-6. Copy the service URL and append `/mcp`, for example
-   `https://bis-physicians-mcp.onrender.com/mcp`.
+1. Push this repository to GitHub or GitLab.
+2. In Render, create a Blueprint from the repository.
+3. Set the prompted InsightMonk, JWT, and MySQL values. `JWT_SECRET` must match `community-api`.
+4. Set `MYSQL_SSL=1` when the database supports TLS. If it requires a CA file, add that file as a Render secret file and set `MYSQL_SSL_CA` to its path.
+5. Let Render generate `MCP_OAUTH_SIGNING_KEY`, then keep the resulting value stable.
+6. Deploy and verify `/health`.
 
-The application derives its external URL from `RENDER_EXTERNAL_HOSTNAME`. On
-another host, set `MCP_SERVER_URL` to the final public HTTPS `/mcp` URL. The
-process binds to `0.0.0.0` and uses the host-provided `PORT`.
+`MCP_SERVER_URL` is automatically derived from `RENDER_EXTERNAL_HOSTNAME` as `https://HOST/mcp`. On another hosting provider, set it explicitly to the final public HTTPS URL before startup.
 
-Free Render services can sleep when idle, which can cause a connector's first
-request to time out. Use an always-on instance for reliable day-to-day use and a
-stable URL so saved platform connections continue working.
+Use an always-on Render plan. OAuth callbacks and MCP calls are sensitive to cold-start timeouts, and clients retain the configured public URL. Multiple instances can share the same application database and `MCP_OAUTH_SIGNING_KEY`.
 
-## Connect ChatGPT
+## Connect AI platforms
 
-1. In ChatGPT on the web, open **Plugins**, select **+**, then **Add custom MCP
-   server**.
-2. Enter the deployed `https://.../mcp` URL.
-3. Choose no authentication if ChatGPT asks for an authentication method.
-4. Create and install the plugin, then enable it in a conversation.
+Add the deployed `https://YOUR-HOST/mcp` URL as a custom remote MCP server or connector. The client discovers OAuth metadata, dynamically registers, opens the InsightMonk login page, and saves the resulting connection. Do not configure a password, static bearer token, or API key in the AI platform.
 
-Workspace permissions and security restrictions can control whether a user may
-add a custom MCP server.
+For ChatGPT, create a custom MCP app/connector with the remote URL and complete the browser authorization flow. For Claude and other compatible clients, add a custom remote connector and allow automatic OAuth discovery. Exact menu labels vary by account type and platform release.
 
-## Connect Claude
+## Token management
 
-1. Open **Customize > Connectors**.
-2. Choose **+ Add**, then **Add custom connector**.
-3. Enter the deployed `https://.../mcp` URL.
-4. Under **Authentication**, select **No sign in**.
-5. Add the connector and enable it in a conversation.
-
-Team and Enterprise administrators may need to add the organization connector
-before members can enable it. Claude stores remote connectors in the user's
-Claude account, so the connection is available across supported Claude clients.
-
-## Connect Codex
-
-Add the URL without a token or authorization header:
-
-```toml
-[mcp_servers.bis_physicians]
-url = "https://YOUR-SERVICE.example/mcp"
-```
-
-## Other MCP clients
-
-Configure the same `https://.../mcp` URL as a Streamable HTTP server. Select
-`None`, `No authentication`, or `No sign in` when the client asks for an
-authentication method. Do not send an `Authorization` header.
+- InsightMonk service-token expiry is decoded from the JWT `exp` claim. The observed production token currently lasts 12 hours, so the code does not assume the older 24-hour value.
+- The token is renewed five minutes before expiry.
+- A process-wide async lock prevents concurrent requests from logging in repeatedly.
+- An upstream HTTP 401 clears the cached token, logs in again, and retries exactly once.
+- MCP access tokens last one hour by default. Rotating refresh tokens use a sliding 30-day lifetime.
+- Deactivating or soft-deleting a user invalidates access on the next request, even if the MCP token has not expired.
 
 ## Tests
 
-The default suite never contacts Supabase:
+Tests mock all InsightMonk HTTP calls and never use real credentials:
 
 ```bash
 python -m pytest -q
 ```
 
-Run the live read-only database check explicitly:
+Coverage includes active/inactive/missing users, expired JWTs, OAuth code and refresh rotation, token renewal and concurrency, retry after 401, report search/retrieval, entitlement and company boundaries, invalid report IDs, PDF extraction, OCR detection, caching, SSRF checks, and all four MCP tools.
 
-```bash
-RUN_SUPABASE_INTEGRATION=1 python -m pytest -q
-```
+## Verified API response assumptions
 
-## Operations
+The production API was inspected without logging sensitive values:
 
-- Stateless HTTP allows multiple service instances without sticky sessions.
-- Keep the public URL stable; AI platforms retain that URL as the connector.
-- Use an always-on deployment to avoid cold-start timeouts.
-- Apply edge rate limits and monitor the structured tool audit logs.
-- Rotate any old `MCP_AUTH_PASSWORD`, `MCP_OAUTH_SIGNING_KEY`, or
-  `MCP_BEARER_TOKEN` values that were exposed, then remove them from deployment
-  settings; this version does not read them.
+- `/v1/auth/login` returns `access_token`, `refresh_token`, `uid`, `cid`, `role`, `status`, `message`, and `token_type`.
+- The access JWT includes `user_id`, `company_id`, `role`, `token_type`, `iat`, `exp`, and `jti`.
+- `/v1/reports/search` returns `success`, `list`, `page`, `limit`, `total`, and `next`.
+- `/v1/reports/getContent` returns `success` plus `data`; `data` includes report metadata and a short-lived signed `url`.
+
+The signed URL, tokens, passwords, authorization headers, and extracted report content are never written to logs. The current upstream report search implementation appears not to apply `to_date`; this MCP forwards the parameter correctly, but fixing that filter belongs in `community-api`. OCR itself is not implemented—scanned pages are identified so callers receive an explicit `ocr_required` result.

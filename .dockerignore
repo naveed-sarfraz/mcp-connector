@@ -1,12 +1,9 @@
 .env
-.agents
-.aws
-.codex
 .git
 .venv
-.pytest_cache
 __pycache__
-*.py[cod]
+.pytest_cache
+*.pyc
 test_*.py
-tiny_client.py
+migrations
 README.md

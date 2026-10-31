@@ -1,6 +1,4 @@
 mcp>=2.3,<3
 httpx>=0.28,<1
-PyJWT>=2.10,<3
 PyMuPDF>=1.25,<2
-PyMySQL>=1.1,<2
 python-dotenv>=1,<2

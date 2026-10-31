@@ -1,175 +1,108 @@
-"""Tests for InsightMonk login, renewal, concurrency, retry, and API parsing."""
+"""Tests for the unauthenticated InsightMonk public report API client."""
 
 from __future__ import annotations
 
-import asyncio
-import time
 from dataclasses import replace
 
 import httpx
-import jwt
 import pytest
 
 from config import settings
 from insightmonk_client import InsightMonkClient, InsightMonkError
 
-JWT_SECRET = "application-jwt-secret-for-tests"
 
-
-def access_token(*, user_id: int = 42, expires_in: int = 3600) -> str:
-    now = int(time.time())
-    return jwt.encode(
-        {
-            "user_id": user_id,
-            "role": "CLIENT",
-            "company_id": 7,
-            "token_type": "access",
-            "iat": now,
-            "exp": now + expires_in,
-            "jti": f"test-{now}-{expires_in}",
-        },
-        JWT_SECRET,
-        algorithm="HS256",
-    )
-
-
-def configured() :  # type: ignore[no-untyped-def]
-    return replace(
-        settings,
-        insightmonk_base_url="https://api.example.test",
-        insightmonk_email="service@example.test",
-        insightmonk_password="service-password",
-        insightmonk_jwt_secret=JWT_SECRET,
-    )
+def configured():  # type: ignore[no-untyped-def]
+    return replace(settings, insightmonk_base_url="https://api.example.test")
 
 
 @pytest.mark.asyncio
-async def test_successful_user_authentication() -> None:
-    token = access_token()
-
+async def test_search_uses_public_endpoint_without_authorization() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/v1/auth/login"
+        assert request.url.path == "/v1/reports/public/search"
+        assert request.method == "POST"
+        assert "authorization" not in request.headers
+        assert request.read()
         return httpx.Response(
             200,
-            json={"status": True, "message": "User logged in successfully.", "access_token": token},
+            json={
+                "success": True,
+                "query": "EV battery 2035",
+                "totalMatches": 2,
+                "returned": 1,
+                "hasMore": True,
+                "nextCursor": "cursor-2",
+                "results": [{"reportId": "a" * 24, "passages": ["Forecast"]}],
+            },
         )
 
     http = httpx.AsyncClient(
         base_url="https://api.example.test", transport=httpx.MockTransport(handler)
     )
     client = InsightMonkClient(configured(), http)
-    result = await client.login_user("user@example.test", "password")
-    assert result.status == "success"
-    assert result.user_id == 42
+    result = await client.search_reports(
+        {"query": "EV battery 2035", "limit": 10, "latestOnly": True}
+    )
+    assert result["hasMore"] is True
+    assert result["nextCursor"] == "cursor-2"
     await http.aclose()
 
 
 @pytest.mark.asyncio
-async def test_expired_application_login_jwt_is_rejected() -> None:
-    token = access_token(expires_in=-60)
+async def test_search_forwards_cursor_and_filters() -> None:
+    expected = {
+        "query": "battery",
+        "limit": 20,
+        "cursor": "next",
+        "reportIds": ["a" * 24],
+        "topics": ["Mobility"],
+        "industryType": "Automotive",
+        "yearFrom": 2025,
+        "yearTo": 2035,
+        "latestOnly": False,
+    }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"status": True, "access_token": token})
+        assert request.url.path == "/v1/reports/public/search"
+        assert request.read()
+        import json
+
+        assert json.loads(request.content) == expected
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "hasMore": False,
+                "nextCursor": None,
+                "results": [],
+            },
+        )
 
     http = httpx.AsyncClient(
         base_url="https://api.example.test", transport=httpx.MockTransport(handler)
     )
     client = InsightMonkClient(configured(), http)
-    with pytest.raises(InsightMonkError, match="invalid login token"):
-        await client.login_user("user@example.test", "password")
+    await client.search_reports(expected)
     await http.aclose()
 
 
 @pytest.mark.asyncio
-async def test_automatic_service_token_renewal_five_minutes_early() -> None:
-    calls = 0
-
+async def test_report_content_uses_public_endpoint_and_parses_pdf() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        return httpx.Response(200, json={"status": True, "access_token": access_token()})
-
-    http = httpx.AsyncClient(
-        base_url="https://api.example.test", transport=httpx.MockTransport(handler)
-    )
-    client = InsightMonkClient(configured(), http)
-    client._service_token = "nearly-expired"
-    client._service_expires_at = int(time.time()) + 299
-    await client.access_token()
-    assert calls == 1
-    await client.access_token()
-    assert calls == 1
-    await http.aclose()
-
-
-@pytest.mark.asyncio
-async def test_concurrent_token_renewal_performs_one_login(monkeypatch: pytest.MonkeyPatch) -> None:
-    http = httpx.AsyncClient(base_url="https://api.example.test", transport=httpx.MockTransport(lambda r: httpx.Response(500)))
-    client = InsightMonkClient(configured(), http)
-    calls = 0
-
-    async def fake_login() -> str:
-        nonlocal calls
-        calls += 1
-        await asyncio.sleep(0.01)
-        client._service_token = "fresh-token"
-        client._service_expires_at = int(time.time()) + 3600
-        return "fresh-token"
-
-    monkeypatch.setattr(client, "_login_service", fake_login)
-    tokens = await asyncio.gather(*(client.access_token() for _ in range(12)))
-    assert tokens == ["fresh-token"] * 12
-    assert calls == 1
-    await http.aclose()
-
-
-@pytest.mark.asyncio
-async def test_request_reauthenticates_and_retries_once_after_401() -> None:
-    login_calls = 0
-    search_calls = 0
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal login_calls, search_calls
-        if request.url.path == "/v1/auth/login":
-            login_calls += 1
-            return httpx.Response(200, json={"status": True, "access_token": access_token()})
-        if request.url.path == "/v1/reports/search":
-            search_calls += 1
-            if search_calls == 1:
-                return httpx.Response(401, json={"message": "expired"})
-            return httpx.Response(
-                200,
-                json={"success": True, "list": [{"_id": "a" * 24}], "page": 1, "limit": 20, "total": 1},
-            )
-        return httpx.Response(404)
-
-    http = httpx.AsyncClient(
-        base_url="https://api.example.test", transport=httpx.MockTransport(handler)
-    )
-    client = InsightMonkClient(configured(), http)
-    result = await client.search_reports({"search": "AI"})
-    assert result["total"] == 1
-    assert login_calls == 2
-    assert search_calls == 2
-    await http.aclose()
-
-
-@pytest.mark.asyncio
-async def test_successful_report_retrieval_parses_observed_response_shape() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/auth/login":
-            return httpx.Response(200, json={"status": True, "access_token": access_token()})
+        assert request.url.path == "/v1/reports/public/content"
+        assert request.url.params["reportId"] == "a" * 24
+        assert "authorization" not in request.headers
         return httpx.Response(
             200,
             json={
                 "success": True,
                 "data": {
-                    "_id": "a" * 24,
+                    "reportId": "a" * 24,
                     "reportName": "AI report",
-                    "cost": 100,
-                    "tag": ["AI"],
-                    "topics": ["Artificial Intelligence"],
-                    "url": "https://files.example.test/signed.pdf?signature=redacted",
+                    "pdf": {
+                        "url": "https://files.example.test/signed.pdf?secret=redacted",
+                        "expiresIn": 300,
+                        "contentType": "application/pdf",
+                    },
                 },
             },
         )
@@ -180,6 +113,33 @@ async def test_successful_report_retrieval_parses_observed_response_shape() -> N
     client = InsightMonkClient(configured(), http)
     report = await client.get_report_content("a" * 24)
     assert report["reportName"] == "AI report"
-    assert report["url"].startswith("https://files.example.test/")
+    assert report["pdf"]["url"].startswith("https://files.example.test/")
     await http.aclose()
 
+
+@pytest.mark.asyncio
+async def test_rate_limit_returns_safe_error() -> None:
+    http = httpx.AsyncClient(
+        base_url="https://api.example.test",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(429, json={"message": "limited"})
+        ),
+    )
+    client = InsightMonkClient(configured(), http)
+    with pytest.raises(InsightMonkError, match="rate limit"):
+        await client.search_reports({"query": "battery"})
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_invalid_public_response_is_rejected() -> None:
+    http = httpx.AsyncClient(
+        base_url="https://api.example.test",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"success": True})
+        ),
+    )
+    client = InsightMonkClient(configured(), http)
+    with pytest.raises(InsightMonkError, match="invalid report search"):
+        await client.search_reports({"query": "battery"})
+    await http.aclose()

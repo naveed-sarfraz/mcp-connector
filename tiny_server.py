@@ -1,53 +1,36 @@
-"""Authenticated InsightMonk Reports MCP server."""
+"""Open InsightMonk Reports MCP server backed by public report APIs."""
 
 from __future__ import annotations
 
 import base64
-import html
 import json
 import logging
 import os
 import re
 from contextlib import asynccontextmanager
-from datetime import date
 from typing import Any, AsyncIterator
 
 from mcp.server import MCPServer
-from mcp.server.auth.middleware.auth_context import get_access_token
-from mcp.server.auth.provider import AuthorizeError
-from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver.exceptions import ToolError
-from mcp.server.request_state import RequestStateSecurity
 from mcp.types import BlobResourceContents, EmbeddedResource, ToolAnnotations
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from starlette.responses import JSONResponse
 
 from config import settings
-from database import Database, UserAccess
 from insightmonk_client import InsightMonkClient, InsightMonkError
-from oauth_provider import InsightMonkOAuthProvider
 from pdf_processor import PDFDocument, PDFProcessingError, PDFProcessor
 
 logger = logging.getLogger("insightmonk_mcp")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 REPORT_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{24}$")
-database = Database(settings)
 insightmonk = InsightMonkClient(settings)
 pdf_processor = PDFProcessor(settings)
-oauth_provider = InsightMonkOAuthProvider(settings, database)
 
 
 @asynccontextmanager
 async def lifespan(_: MCPServer) -> AsyncIterator[None]:
     settings.validate()
-    if settings.auto_migrate:
-        await database.migrate()
-    else:
-        await database.ping()
-    # Fail deployment early if the service credentials are invalid. The manager
-    # renews from JWT exp and re-authenticates once after an upstream 401.
-    await insightmonk.access_token()
     try:
         yield
     finally:
@@ -58,144 +41,13 @@ async def lifespan(_: MCPServer) -> AsyncIterator[None]:
 mcp = MCPServer(
     "InsightMonk Reports",
     instructions=(
-        "Search and read InsightMonk research reports. Every request uses the signed-in "
-        "user's current application authorization and existing report entitlements."
+        "Search and read active InsightMonk reports through the public report API. "
+        "No connector authentication is required. For broad searches, continue with "
+        "nextCursor while hasMore is true. Prefer the latest edition unless the user "
+        "explicitly asks for historical editions."
     ),
-    auth_server_provider=oauth_provider,
-    auth=AuthSettings(
-        issuer_url=settings.issuer_url,
-        resource_server_url=settings.server_url,
-        required_scopes=[oauth_provider.scope],
-        validate_token_resource=True,
-        client_registration_options=ClientRegistrationOptions(
-            enabled=True,
-            valid_scopes=[oauth_provider.scope],
-            default_scopes=[oauth_provider.scope],
-        ),
-        revocation_options=RevocationOptions(enabled=True),
-    ),
-    request_state_security=RequestStateSecurity(keys=[settings.oauth_signing_key]),
     lifespan=lifespan,
 )
-
-
-def _security_headers(response: Response) -> Response:
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Pragma"] = "no-cache"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
-        "base-uri 'none'; frame-ancestors 'none'"
-    )
-    return response
-
-
-def _login_page(
-    request_token: str,
-    *,
-    client_name: str = "your AI assistant",
-    error: str | None = None,
-) -> HTMLResponse:
-    safe_request = html.escape(request_token, quote=True)
-    safe_client = html.escape(client_name)
-    error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
-    body = f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Connect InsightMonk</title><style>
-body{{font-family:system-ui,sans-serif;background:#f4f6f8;color:#17202a;margin:0;padding:2rem}}
-main{{max-width:28rem;margin:4vh auto;background:white;padding:2rem;border-radius:14px;box-shadow:0 8px 30px #0001}}
-label{{display:block;margin:1rem 0 .35rem}}input{{box-sizing:border-box;width:100%;padding:.75rem;border:1px solid #aeb6bf;border-radius:8px}}
-button{{width:100%;margin-top:1.4rem;padding:.8rem;border:0;border-radius:8px;background:#145a8d;color:white;font-weight:650}}
-.note{{font-size:.9rem;color:#566573}}.error{{color:#a93226}}
-</style></head><body><main><h1>Connect InsightMonk</h1>
-<p>Sign in once to authorize <strong>{safe_client}</strong> to read reports available to your InsightMonk account.</p>
-{error_html}<form method="post" action="/oauth/login" autocomplete="on">
-<input type="hidden" name="request" value="{safe_request}">
-<label for="email">InsightMonk email</label><input id="email" name="email" type="email" maxlength="254" required autocomplete="username">
-<label for="password">Password</label><input id="password" name="password" type="password" maxlength="128" required autocomplete="current-password">
-<button type="submit">Sign in and connect</button></form>
-<p class="note">Your password is sent only to InsightMonk for this login and is never stored by the MCP server or shared with the AI platform.</p>
-</main></body></html>"""
-    return _security_headers(HTMLResponse(body))  # type: ignore[return-value]
-
-
-def _otp_page(mfa_state: str, *, error: str | None = None) -> HTMLResponse:
-    safe_state = html.escape(mfa_state, quote=True)
-    error_html = f'<p class="error">{html.escape(error)}</p>' if error else ""
-    body = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Verify InsightMonk login</title><style>
-body{{font-family:system-ui,sans-serif;background:#f4f6f8;color:#17202a;margin:0;padding:2rem}}main{{max-width:28rem;margin:8vh auto;background:white;padding:2rem;border-radius:14px}}
-label{{display:block;margin:1rem 0 .35rem}}input{{box-sizing:border-box;width:100%;padding:.75rem}}button{{width:100%;margin-top:1.4rem;padding:.8rem;background:#145a8d;color:white;border:0;border-radius:8px}}.error{{color:#a93226}}</style>
-</head><body><main><h1>Verify your login</h1><p>Enter the one-time code sent by InsightMonk.</p>{error_html}
-<form method="post" action="/oauth/verify"><input type="hidden" name="state" value="{safe_state}">
-<label for="otp">Verification code</label><input id="otp" name="otp" inputmode="numeric" maxlength="12" required autocomplete="one-time-code">
-<button type="submit">Verify and connect</button></form></main></body></html>"""
-    return _security_headers(HTMLResponse(body))  # type: ignore[return-value]
-
-
-async def _client_name(request_token: str) -> str:
-    try:
-        payload = oauth_provider.decode_authorization_request(request_token)
-        client = await oauth_provider.get_client(str(payload.get("client_id", "")))
-        return client.client_name if client and client.client_name else "your AI assistant"
-    except AuthorizeError:
-        return "your AI assistant"
-
-
-@mcp.custom_route("/oauth/login", methods=["GET", "POST"], include_in_schema=False)
-async def oauth_login(request: Request) -> Response:
-    if request.method == "GET":
-        request_token = request.query_params.get("request", "")
-        try:
-            oauth_provider.decode_authorization_request(request_token)
-        except AuthorizeError:
-            return _security_headers(HTMLResponse("Login request is invalid or expired.", status_code=400))
-        return _login_page(request_token, client_name=await _client_name(request_token))
-
-    form = await request.form()
-    request_token = str(form.get("request") or "")
-    email = str(form.get("email") or "").strip()
-    password = str(form.get("password") or "")
-    try:
-        oauth_provider.decode_authorization_request(request_token)
-    except AuthorizeError:
-        return _security_headers(HTMLResponse("Login request is invalid or expired.", status_code=400))
-    client_name = await _client_name(request_token)
-    if not email or len(email) > 254 or not password or len(password) > 128:
-        return _login_page(request_token, client_name=client_name, error="Enter a valid email and password.")
-    try:
-        result = await insightmonk.login_user(email, password)
-        if result.status == "mfa" and result.email:
-            return _otp_page(oauth_provider.create_mfa_state(result.email, request_token))
-        if result.user_id is None:
-            raise InsightMonkError("InsightMonk returned an invalid login response.")
-        redirect_url = await oauth_provider.complete_authorization(request_token, result.user_id)
-        return _security_headers(RedirectResponse(redirect_url, status_code=302))
-    except (InsightMonkError, AuthorizeError) as error:
-        return _login_page(request_token, client_name=client_name, error=str(error))
-
-
-@mcp.custom_route("/oauth/verify", methods=["POST"], include_in_schema=False)
-async def oauth_verify(request: Request) -> Response:
-    form = await request.form()
-    mfa_token = str(form.get("state") or "")
-    otp = str(form.get("otp") or "").strip()
-    try:
-        mfa = oauth_provider.decode_mfa_state(mfa_token)
-        if not otp or len(otp) > 12:
-            return _otp_page(mfa_token, error="Enter a valid verification code.")
-        result = await insightmonk.verify_user_otp(str(mfa["email"]), otp)
-        if result.user_id is None:
-            raise InsightMonkError("InsightMonk returned an invalid verification response.")
-        redirect_url = await oauth_provider.complete_authorization(
-            str(mfa["authorization_request"]), result.user_id
-        )
-        return _security_headers(RedirectResponse(redirect_url, status_code=302))
-    except (InsightMonkError, AuthorizeError, KeyError) as error:
-        message = str(error) if not isinstance(error, KeyError) else "The verification request is invalid."
-        return _otp_page(mfa_token, error=message)
 
 
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
@@ -210,33 +62,17 @@ async def service_info(_: Request) -> JSONResponse:
             "name": "InsightMonk Reports MCP server",
             "transport": "streamable-http",
             "mcp_url": settings.server_url,
-            "authentication": "OAuth 2.1 authorization code with PKCE",
-            "access_policy": "all active InsightMonk users; existing report entitlements apply",
+            "authentication": "none",
+            "access_policy": "public access to active reports exposed by the public API",
         }
     )
 
 
-def _audit(tool: str, user_id: int | None, status: str, report_id: str | None = None) -> None:
-    event: dict[str, Any] = {"tool": tool, "user_id": user_id, "status": status}
+def _audit(tool: str, status: str, report_id: str | None = None) -> None:
+    event: dict[str, Any] = {"tool": tool, "status": status}
     if report_id:
         event["report_id"] = report_id
     logger.info(json.dumps(event, separators=(",", ":")))
-
-
-async def require_current_user() -> UserAccess:
-    access_token = get_access_token()
-    subject = access_token.subject if access_token else None
-    if subject is None and settings.dev_mode and os.getenv("MCP_TRANSPORT") == "stdio":
-        subject = os.getenv("MCP_DEV_USER_ID")
-    if subject is None:
-        raise ToolError("Authentication is required.")
-    try:
-        user = await database.get_user(subject)
-    except Exception:
-        raise ToolError("User authorization is temporarily unavailable.") from None
-    if user is None or not user.mcp_allowed:
-        raise ToolError("This InsightMonk account is not authorized to use MCP.")
-    return user
 
 
 def _validated_report_id(report_id: str) -> str:
@@ -247,34 +83,47 @@ def _validated_report_id(report_id: str) -> str:
 
 
 def _metadata_without_pdf_url(data: dict[str, Any]) -> dict[str, Any]:
-    sensitive_keys = {"url", "access_token", "refresh_token", "password"}
-    return {key: value for key, value in data.items() if key.lower() not in sensitive_keys}
+    sensitive_keys = {
+        "url",
+        "access_token",
+        "refresh_token",
+        "authorization",
+        "password",
+    }
+
+    def redact(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: redact(item)
+                for key, item in value.items()
+                if key.lower() not in sensitive_keys
+            }
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+
+    result = redact(data)
+    return result if isinstance(result, dict) else {}
 
 
-async def _report_document(tool: str, report_id: str) -> tuple[UserAccess, dict[str, Any], PDFDocument]:
-    user = await require_current_user()
+async def _report_document(
+    tool: str, report_id: str
+) -> tuple[dict[str, Any], PDFDocument]:
     normalized_id = _validated_report_id(report_id)
     try:
         report = await insightmonk.get_report_content(normalized_id)
-        raw_topics = report.get("topics")
-        topics = raw_topics if isinstance(raw_topics, list) else []
-        try:
-            allowed = await database.can_access_full_report(user, normalized_id, topics)
-        except Exception:
-            _audit(tool, user.user_id, "ERROR", normalized_id)
-            raise ToolError("Report authorization is temporarily unavailable.") from None
-        if not allowed:
-            _audit(tool, user.user_id, "DENIED", normalized_id)
-            raise ToolError("This report is not available to your InsightMonk account.")
-        document = await pdf_processor.get_document(normalized_id, str(report["url"]))
-        return user, report, document
+        pdf = report.get("pdf")
+        if not isinstance(pdf, dict) or not isinstance(pdf.get("url"), str):
+            raise InsightMonkError("This report does not include a downloadable PDF.")
+        document = await pdf_processor.get_document(normalized_id, pdf["url"])
+        return report, document
     except ToolError:
         raise
     except (InsightMonkError, PDFProcessingError) as error:
-        _audit(tool, user.user_id, "ERROR", normalized_id)
+        _audit(tool, "ERROR", normalized_id)
         raise ToolError(str(error)) from None
     except Exception:
-        _audit(tool, user.user_id, "ERROR", normalized_id)
+        _audit(tool, "ERROR", normalized_id)
         raise ToolError("The report is temporarily unavailable.") from None
 
 
@@ -288,58 +137,92 @@ READ_ONLY = ToolAnnotations(
 
 @mcp.tool(title="Search InsightMonk reports", annotations=READ_ONLY)
 async def search_reports(
-    search: str,
-    from_date: str = "2000-01-01",
-    to_date: str = "",
-    report_type: str = "Full",
-    page: int = 1,
+    query: str,
     limit: int = 20,
+    cursor: str = "",
+    report_ids: list[str] | None = None,
+    topics: list[str] | None = None,
+    industry_type: str = "",
+    year_from: int | None = None,
+    year_to: int | None = None,
+    latest_only: bool = True,
 ) -> dict[str, Any]:
-    """Search report metadata using configurable text, dates, type, page, and limit."""
-    user = await require_current_user()
-    search_text = search.strip() if isinstance(search, str) else ""
-    if len(search_text) > 200:
-        raise ToolError("search must contain at most 200 characters.")
-    effective_to_date = to_date or date.today().isoformat()
-    try:
-        start = date.fromisoformat(from_date)
-        end = date.fromisoformat(effective_to_date)
-    except ValueError:
-        raise ToolError("from_date and to_date must use YYYY-MM-DD.") from None
-    if start > end:
-        raise ToolError("from_date must not be after to_date.")
-    normalized_type = report_type.strip() if isinstance(report_type, str) else ""
-    if not normalized_type or len(normalized_type) > 40:
-        raise ToolError("report_type must contain 1 to 40 characters.")
-    if not 1 <= page <= 10000:
-        raise ToolError("page must be between 1 and 10000.")
-    if not 1 <= limit <= 100:
-        raise ToolError("limit must be between 1 and 100.")
+    """Search all indexed active reports and return passages with citations.
 
-    payload = {
-        "search": search_text,
-        "from_date": from_date,
-        "to_date": effective_to_date,
-        "type": normalized_type,
-        "page": page,
+    When hasMore is true, call this tool again promptly with nextCursor as cursor
+    and keep every other argument unchanged. Cursors expire after two minutes.
+    """
+    search_text = query.strip() if isinstance(query, str) else ""
+    if not 2 <= len(search_text) <= 500:
+        raise ToolError("query must contain 2 to 500 characters.")
+    if not 1 <= limit <= 50:
+        raise ToolError("limit must be between 1 and 50.")
+    cursor_value = cursor.strip() if isinstance(cursor, str) else ""
+    if len(cursor_value) > 12000:
+        raise ToolError("cursor is invalid.")
+
+    normalized_report_ids = report_ids or []
+    if len(normalized_report_ids) > 50 or any(
+        not isinstance(value, str) or not REPORT_ID_PATTERN.fullmatch(value.strip())
+        for value in normalized_report_ids
+    ):
+        raise ToolError("report_ids must contain at most 50 valid report IDs.")
+    normalized_report_ids = [value.strip().lower() for value in normalized_report_ids]
+
+    normalized_topics = topics or []
+    if len(normalized_topics) > 20 or any(
+        not isinstance(value, str) or not 1 <= len(value.strip()) <= 100
+        for value in normalized_topics
+    ):
+        raise ToolError("topics must contain at most 20 non-empty values.")
+    normalized_topics = [value.strip() for value in normalized_topics]
+
+    normalized_industry = (
+        industry_type.strip() if isinstance(industry_type, str) else ""
+    )
+    if len(normalized_industry) > 100:
+        raise ToolError("industry_type must contain at most 100 characters.")
+    if year_from is not None and not 1900 <= year_from <= 2100:
+        raise ToolError("year_from must be between 1900 and 2100.")
+    if year_to is not None and not 1900 <= year_to <= 2100:
+        raise ToolError("year_to must be between 1900 and 2100.")
+    if year_from is not None and year_to is not None and year_from > year_to:
+        raise ToolError("year_from must not be after year_to.")
+
+    payload: dict[str, Any] = {
+        "query": search_text,
         "limit": limit,
+        "latestOnly": latest_only,
     }
+    if cursor_value:
+        payload["cursor"] = cursor_value
+    if normalized_report_ids:
+        payload["reportIds"] = normalized_report_ids
+    if normalized_topics:
+        payload["topics"] = normalized_topics
+    if normalized_industry:
+        payload["industryType"] = normalized_industry
+    if year_from is not None:
+        payload["yearFrom"] = year_from
+    if year_to is not None:
+        payload["yearTo"] = year_to
+
     try:
         result = await insightmonk.search_reports(payload)
     except InsightMonkError as error:
-        _audit("search_reports", user.user_id, "ERROR")
+        _audit("search_reports", "ERROR")
         raise ToolError(str(error)) from None
     except Exception:
-        _audit("search_reports", user.user_id, "ERROR")
+        _audit("search_reports", "ERROR")
         raise ToolError("Report search is temporarily unavailable.") from None
-    _audit("search_reports", user.user_id, "ALLOWED")
+    _audit("search_reports", "ALLOWED")
     return result
 
 
 @mcp.tool(title="Get report content", annotations=READ_ONLY)
 async def get_report_content(report_id: str) -> dict[str, Any]:
-    """Return authorized report metadata and page-numbered extracted PDF text."""
-    user, report, document = await _report_document("get_report_content", report_id)
+    """Return report metadata and page-numbered extracted PDF text."""
+    report, document = await _report_document("get_report_content", report_id)
     remaining = settings.pdf_max_extracted_characters
     pages: list[dict[str, Any]] = []
     truncated = False
@@ -353,7 +236,7 @@ async def get_report_content(report_id: str) -> dict[str, Any]:
             truncated = True
         pages.append({"page_number": page_data.page_number, "text": text})
         remaining -= len(text)
-    _audit("get_report_content", user.user_id, "ALLOWED", document.report_id)
+    _audit("get_report_content", "ALLOWED", document.report_id)
     return {
         "report": _metadata_without_pdf_url(report),
         "page_count": len(document.pages),
@@ -366,15 +249,18 @@ async def get_report_content(report_id: str) -> dict[str, Any]:
 
 @mcp.tool(title="Download report PDF", annotations=READ_ONLY)
 async def download_report_pdf(report_id: str) -> EmbeddedResource:
-    """Return the authorized original PDF as an embedded MCP file resource."""
-    user, report, document = await _report_document("download_report_pdf", report_id)
+    """Return the original report PDF as an embedded MCP file resource."""
+    report, document = await _report_document("download_report_pdf", report_id)
     if len(document.content) > settings.pdf_max_embedded_bytes:
         raise ToolError(
-            "The PDF is too large to return through MCP; use the InsightMonk application to download it."
+            "The PDF is too large to return through MCP; use get_report_content instead."
         )
     title = str(report.get("reportName") or document.report_id)
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", title).strip("-.")[:100] or document.report_id
-    _audit("download_report_pdf", user.user_id, "ALLOWED", document.report_id)
+    safe_name = (
+        re.sub(r"[^A-Za-z0-9._-]+", "-", title).strip("-.")[:100]
+        or document.report_id
+    )
+    _audit("download_report_pdf", "ALLOWED", document.report_id)
     return EmbeddedResource(
         resource=BlobResourceContents(
             uri=f"insightmonk://reports/{document.report_id}/{safe_name}.pdf",
@@ -388,15 +274,15 @@ async def download_report_pdf(report_id: str) -> EmbeddedResource:
 async def search_report_content(
     report_id: str, query: str, limit: int = 20
 ) -> dict[str, Any]:
-    """Search an authorized report and return matching passages with PDF page numbers."""
+    """Search a report and return matching passages with PDF page numbers."""
     search_text = query.strip() if isinstance(query, str) else ""
     if not 1 <= len(search_text) <= 200:
         raise ToolError("query must contain 1 to 200 characters.")
     if not 1 <= limit <= 50:
         raise ToolError("limit must be between 1 and 50.")
-    user, report, document = await _report_document("search_report_content", report_id)
+    report, document = await _report_document("search_report_content", report_id)
     matches = pdf_processor.search(document, search_text, limit=limit)
-    _audit("search_report_content", user.user_id, "ALLOWED", document.report_id)
+    _audit("search_report_content", "ALLOWED", document.report_id)
     return {
         "report": _metadata_without_pdf_url(report),
         "query": search_text,

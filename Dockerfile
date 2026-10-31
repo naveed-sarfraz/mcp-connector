@@ -12,7 +12,7 @@ COPY requirements.txt ./
 RUN python -m pip install --upgrade pip && \
     python -m pip install -r requirements.txt
 
-COPY config.py database.py insightmonk_client.py oauth_provider.py pdf_processor.py tiny_server.py ./
+COPY config.py insightmonk_client.py pdf_processor.py tiny_server.py ./
 
 USER app
 EXPOSE 8000
